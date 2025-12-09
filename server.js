@@ -1,5 +1,5 @@
 // server.js
-// Fresh backend: Health, OpenAI chat, mascot upload (local), safe defaults.
+// Fresh backend with RAG-style context + per-site daily limit.
 
 const express = require("express");
 const cors = require("cors");
@@ -17,6 +17,51 @@ const app = express();
 // ---------- Config ----------
 const PORT = process.env.PORT || 8080;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+
+// daily quota per site/domain (admin can change in env)
+const QUOTA_PER_DAY = parseInt(process.env.QUOTA_PER_DAY || "15", 10);
+const QUOTA_FILE = path.join(__dirname, "quotas.json");
+
+// ---------- Quota helpers ----------
+function readQuotaStore() {
+  try {
+    if (!fs.existsSync(QUOTA_FILE)) return {};
+    const raw = fs.readFileSync(QUOTA_FILE, "utf8") || "{}";
+    return JSON.parse(raw);
+  } catch (e) {
+    console.warn("readQuotaStore failed:", e);
+    return {};
+  }
+}
+
+function writeQuotaStore(data) {
+  try {
+    fs.writeFileSync(QUOTA_FILE, JSON.stringify(data, null, 2), "utf8");
+  } catch (e) {
+    console.warn("writeQuotaStore failed:", e);
+  }
+}
+
+/**
+ * Check & increment daily quota per siteKey (e.g. domain/origin).
+ * Returns { allowed: boolean, remaining: number }
+ */
+function checkAndIncrementQuota(siteKey) {
+  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  const store = readQuotaStore();
+
+  if (!store[today]) store[today] = {};
+  const used = store[today][siteKey] || 0;
+
+  if (used >= QUOTA_PER_DAY) {
+    return { allowed: false, remaining: 0 };
+  }
+
+  store[today][siteKey] = used + 1;
+  writeQuotaStore(store);
+
+  return { allowed: true, remaining: QUOTA_PER_DAY - (used + 1) };
+}
 
 // ---------- Middlewares ----------
 app.use(
@@ -38,7 +83,11 @@ app.use(
 
 // Logging (no bodies)
 morgan.token("reqid", () => Math.random().toString(36).slice(2, 9));
-app.use(morgan(":reqid :method :url :status - :response-time ms", { skip: r => r.path === "/health" }));
+app.use(
+  morgan(":reqid :method :url :status - :response-time ms", {
+    skip: (r) => r.path === "/health",
+  })
+);
 
 // Rate limit just the AI & upload endpoints
 const limiter = rateLimit({
@@ -53,13 +102,20 @@ app.use("/mascot/upload", limiter);
 // ---------- Health ----------
 app.get("/", (_req, res) => res.status(200).send("OK"));
 app.get("/health", (_req, res) =>
-  res.json({ ok: true, service: "mascot-backend", time: new Date().toISOString() })
+  res.json({
+    ok: true,
+    service: "mascot-backend",
+    time: new Date().toISOString(),
+  })
 );
 
 // ---------- Diagnostics ----------
 app.get("/openai/ping", async (_req, res) => {
   try {
-    if (!OPENAI_API_KEY) return res.status(500).json({ ok: false, detail: "OPENAI_API_KEY not set" });
+    if (!OPENAI_API_KEY)
+      return res
+        .status(500)
+        .json({ ok: false, detail: "OPENAI_API_KEY not set" });
     const r = await axios.get("https://api.openai.com/v1/models", {
       headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
       timeout: 10000,
@@ -77,27 +133,81 @@ app.get("/chat", (_req, res) =>
   res.status(405).json({ error: "Use POST /chat", example: { message: "Hello" } })
 );
 
-// ---------- Chat (OpenAI) ----------
+// ---------- Chat (OpenAI + RAG + quota) ----------
 const SYSTEM_PROMPT =
   "You are Academic Technexus's helpful assistant. Be concise, friendly, and safe.";
 
 app.post("/chat", async (req, res) => {
   try {
-    const userMessage = (req.body?.message || "").toString().trim();
-    if (!userMessage) return res.status(400).json({ error: "Missing 'message' in body." });
+    // support both old shape {message} and new {text, context, site, pageUrl}
+    const userMessage = (
+      req.body?.message ||
+      req.body?.text ||
+      ""
+    )
+      .toString()
+      .trim();
+
+    if (!userMessage)
+      return res.status(400).json({ error: "Missing 'message' or 'text' in body." });
 
     if (!OPENAI_API_KEY) {
-      return res.status(500).json({ reply: "⚠️ Server not configured with OPENAI_API_KEY." });
+      return res.status(500).json({
+        reply: "⚠️ Server not configured with OPENAI_API_KEY.",
+      });
     }
+
+    const pageUrl = (req.body?.pageUrl || "").toString();
+    const site = (req.body?.site || "").toString();
+    const contextRaw = (req.body?.context || "").toString();
+
+    const originHeader = req.headers.origin || "";
+    const siteKey = site || originHeader || "unknown-site";
+
+    // --- Per-site daily quota ---
+    const { allowed, remaining } = checkAndIncrementQuota(siteKey);
+    if (!allowed) {
+      return res.status(429).json({
+        error: "daily_limit_reached",
+        message: "Daily chat limit has been reached for this site.",
+        remaining: 0,
+        reply:
+          "Daily chat limit has been reached for this site. Please try again tomorrow.",
+      });
+    }
+
+    // --- RAG-style context (lightweight) ---
+    const contextText =
+      contextRaw.trim().slice(0, 3000) ||
+      "No specific page context was provided.";
+
+    const systemContext = [
+      "You are an AI assistant embedded on a website or app.",
+      "Use the provided CONTEXT from the current page when it is relevant to the user's question.",
+      "If the context is not helpful or is unrelated, fall back to your general knowledge.",
+      "Always answer clearly and concisely.",
+    ].join(" ");
+
+    const contextPrompt = [
+      "CONTEXT FROM WEBSITE / APP:",
+      `Site: ${site || originHeader || "unknown"}`,
+      `Page URL: ${pageUrl || "unknown"}`,
+      "---",
+      contextText,
+    ].join("\n");
+
+    const messages = [
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "system", content: systemContext },
+      { role: "system", content: contextPrompt },
+      { role: "user", content: userMessage },
+    ];
 
     const ai = await axios.post(
       "https://api.openai.com/v1/chat/completions",
       {
         model: "gpt-4o-mini",
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: userMessage },
-        ],
+        messages,
         temperature: 0.6,
         max_tokens: 500,
       },
@@ -110,8 +220,11 @@ app.post("/chat", async (req, res) => {
       }
     );
 
-    const reply = ai?.data?.choices?.[0]?.message?.content?.trim() || "Sorry, I couldn’t generate a response.";
-    res.json({ reply });
+    const reply =
+      ai?.data?.choices?.[0]?.message?.content?.trim() ||
+      "Sorry, I couldn’t generate a response.";
+
+    res.json({ reply, remaining });
   } catch (err) {
     const status = err?.response?.status || 502;
     const code = err?.response?.data?.error?.code;
@@ -125,15 +238,23 @@ app.post("/chat", async (req, res) => {
 });
 
 // ---------- Mascot Upload (local storage) ----------
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } }); // 5MB
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+}); // 5MB
 const UPLOAD_DIR = path.join(__dirname, "uploads");
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
 app.use("/uploads", express.static(UPLOAD_DIR));
 
 app.post("/mascot/upload", upload.single("mascot"), (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ success: false, error: "No file uploaded. Field name 'mascot'." });
-    const safeName = `${Date.now()}_${(req.file.originalname || "mascot").replace(/[^\w.-]/g, "_")}`;
+    if (!req.file)
+      return res
+        .status(400)
+        .json({ success: false, error: "No file uploaded. Field name 'mascot'." });
+    const safeName = `${Date.now()}_${(
+      req.file.originalname || "mascot"
+    ).replace(/[^\w.-]/g, "_")}`;
     fs.writeFileSync(path.join(UPLOAD_DIR, safeName), req.file.buffer);
     return res.json({ success: true, url: `/uploads/${safeName}` });
   } catch (e) {
@@ -143,4 +264,6 @@ app.post("/mascot/upload", upload.single("mascot"), (req, res) => {
 });
 
 // ---------- Start ----------
-app.listen(PORT, () => console.log(`✅ Secure server running on port ${PORT}`));
+app.listen(PORT, () =>
+  console.log(`✅ Secure server running on port ${PORT}, quota per day: ${QUOTA_PER_DAY}`)
+);
